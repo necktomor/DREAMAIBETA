@@ -40,8 +40,8 @@
     }
   ],
   "landscape": {
-    "ground_color_low": "#3a5230",
-    "ground_color_high": "#7a9255",
+    "ground_color_low": "#3d6b2f",
+    "ground_color_high": "#a4c95c",
     "hill_scale": 1.2,
     "center_elevation": 6,
     "water": false,

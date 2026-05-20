@@ -103,14 +103,16 @@ function init() {
 
 // ─── Toon gradient texture ───────────────────────────────────────────────────
 function makeToonGradient() {
-  // 4-band cel-shading gradient (RGBA, since RGBFormat was removed in r155+)
+  // 5-band Genshin-style cel gradient with cool shadow + warm midtone bias
+  // Each pixel is RGBA. Steps are sharp (NearestFilter) for hard cel bands.
   const data = new Uint8Array([
-    60, 60, 60, 255,
-    130, 130, 130, 255,
-    200, 200, 200, 255,
-    255, 255, 255, 255,
+    72, 76, 92, 255,    // deep cool shadow
+    122, 116, 130, 255, // shadow
+    180, 168, 158, 255, // half-tone (warm)
+    225, 218, 200, 255, // mid-light
+    255, 250, 235, 255, // highlight
   ]);
-  const tex = new THREE.DataTexture(data, 4, 1, THREE.RGBAFormat);
+  const tex = new THREE.DataTexture(data, 5, 1, THREE.RGBAFormat);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -165,6 +167,13 @@ async function loadScene() {
   setProgress(94, 'Finalising terrain…');
   rebuildTerrainMesh();
 
+  // Re-snap every tree/rock to current (post-flatten) terrain so nothing floats
+  resnapNatureToTerrain();
+  // Re-snap building meshes too (their footprint zone might have shifted)
+  resnapBuildingsToTerrain();
+  // Hard force: any remaining dark-textured TRELLIS materials get re-tinted
+  forceFixMaterials();
+
   // Spawn at angled cinematic viewpoint — see castle in 3/4 perspective, not blocked by gate
   const spawnX = 35;
   const spawnZ = 70;
@@ -180,7 +189,7 @@ async function loadScene() {
   player.position.set(spawnX, getTerrainY(spawnX, spawnZ) + 1, spawnZ);
   // Face toward origin (castle keep) at a slight downward angle
   yaw = Math.atan2(spawnX, spawnZ) + Math.PI;
-  pitch = -0.12;
+  pitch = 0.05;
   window.__dreamai = { scene, camera, player, getTerrainY };
   setProgress(100, 'Ready');
 }
@@ -192,13 +201,13 @@ async function spawnObject(loader, mod, gdata, cellSize) {
     const gltf = await new Promise((res, rej) => loader.load(url, res, null, rej));
     const root = gltf.scene;
 
-    // Cel-shaded materials (convert MeshStandard → MeshToon)
+    // Cel-shaded materials (convert MeshStandard → MeshToon) with building hint
     root.traverse((node) => {
       if (!node.isMesh) return;
       node.castShadow = true;
       node.receiveShadow = true;
       const mats = Array.isArray(node.material) ? node.material : [node.material];
-      const replaced = mats.map((m) => convertToToon(m));
+      const replaced = mats.map((m) => convertToToon(m, 'building'));
       node.material = replaced.length === 1 ? replaced[0] : replaced;
     });
 
@@ -246,11 +255,16 @@ async function spawnObject(loader, mod, gdata, cellSize) {
 
     // Use actual mesh bottom (no 8% percentile) so it sits flat
     const meshBottomY = boxAfter.min.y;
-    root.position.y = minGroundY - meshBottomY + (gdata.y_offset || 0);
+    // Sink 0.05m into ground to hide any geometry gap from triangle quantisation
+    root.position.y = minGroundY - meshBottomY - 0.05 + (gdata.y_offset || 0);
 
     scene.add(root);
+    buildingClones.push({ obj: root, gx, gz, fr, yOffset: gdata.y_offset || 0 });
     addCollisionBox(root, mod.name);
     registerFlattenZone(gx, gz, fr + 12, minGroundY);
+
+    // Genshin-style outline: a slightly larger back-faced dark mesh around the building
+    addOutline(root, 0.02);
   } catch (e) {
     console.warn(`Failed: ${mod.name} — ${e.message}`);
     spawnPlaceholder(mod, gdata, cellSize);
@@ -270,38 +284,56 @@ function spawnPlaceholder(mod, gdata, cellSize) {
   scene.add(mesh);
 }
 
-function convertToToon(m) {
+function convertToToon(m, hint = null) {
   if (!m) return new THREE.MeshToonMaterial({ color: 0xaaaaaa, gradientMap: toonGradient });
   if (m.isMeshToonMaterial) return m;
-  // Brighten dark TRELLIS-generated albedos so they read in daylight
   let col;
   if (m.color) {
     col = m.color.clone();
-    // If material is very dark, lift toward mid-grey
     const lum = col.r * 0.3 + col.g * 0.59 + col.b * 0.11;
-    if (lum < 0.15) {
-      col.lerp(new THREE.Color(0xaaaaaa), 0.6);
-    }
+    // Lift dark albedos. If we know it's foliage → green; stone → warm grey.
+    const target =
+      hint === 'tree' ? new THREE.Color(0x6ea63a) :   // vibrant foliage green
+      hint === 'rock' ? new THREE.Color(0x8a7a6a) :   // warm stone
+      hint === 'building' ? new THREE.Color(0xc4b8a4) : // light tan stone
+      new THREE.Color(0xb09680);
+    if (lum < 0.2) col.lerp(target, 0.78);
+    else if (lum < 0.45) col.lerp(target, 0.4);
+    // Boost saturation for Genshin look
+    const hsl = { h: 0, s: 0, l: 0 };
+    col.getHSL(hsl);
+    hsl.s = Math.min(1, hsl.s * 1.5 + 0.2);
+    hsl.l = Math.max(hsl.l, 0.32);  // never let it stay too dark
+    col.setHSL(hsl.h, hsl.s, hsl.l);
   } else {
     col = new THREE.Color(0xcccccc);
   }
+  // If hint says foliage/rock and original has a texture, IGNORE it (TRELLIS
+  // textures bake the prompt's dark background into trees → black silhouettes).
+  // For buildings keep the map (gives wall/stone detail).
+  const useMap = m.map && hint === 'building';
   const toon = new THREE.MeshToonMaterial({
     color: col,
-    map: m.map || null,
+    map: useMap ? m.map : null,
     gradientMap: toonGradient,
     transparent: !!m.transparent,
     opacity: m.opacity ?? 1,
     side: m.side ?? THREE.FrontSide,
   });
-  // If the original had emissive/textures, copy them
+  // Emissive lift so silhouettes never go pure black in shadow
+  toon.emissive = col.clone().multiplyScalar(0.4);
   if (m.emissive && m.emissive.getHex() !== 0) {
-    toon.emissive = m.emissive.clone();
-    toon.emissiveIntensity = m.emissiveIntensity ?? 1;
+    toon.emissive.add(m.emissive.clone().multiplyScalar(m.emissiveIntensity ?? 1));
   }
   return toon;
 }
 
 // ─── Nature: InstancedMesh per archetype ─────────────────────────────────────
+// Track every placed nature clone so we can re-snap to terrain after final rebuild
+const natureClones = [];
+// Track buildings the same way
+const buildingClones = [];
+
 async function loadNatureArchetypes(loader, archetypes, landscape) {
   const waterLevel = landscape?.water_level ?? 0;
   const hasWater = !!landscape?.water;
@@ -317,11 +349,16 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
       continue;
     }
 
-    // Cel-shading materials
+    // Cel-shading materials with hint (tree/rock for better default tinting)
+    const archHint =
+      /tree|pine|oak|palm|bush|bamboo|fir|cypress/i.test(arch.name) ? 'tree' :
+      /rock|stone|boulder|pebble/i.test(arch.name) ? 'rock' : null;
     proto.traverse((n) => {
       if (!n.isMesh) return;
       const mats = Array.isArray(n.material) ? n.material : [n.material];
-      n.material = mats.length === 1 ? convertToToon(mats[0]) : mats.map(convertToToon);
+      n.material = mats.length === 1
+        ? convertToToon(mats[0], archHint)
+        : mats.map((mm) => convertToToon(mm, archHint));
     });
 
     // Uniformly scale proto to target real_world_size
@@ -336,10 +373,6 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
     proto.scale.setScalar(baseScale);
     proto.updateMatrixWorld(true);
 
-    // Measure bottom AFTER scaling so we know how much to lift each instance
-    const scaledBox = new THREE.Box3().setFromObject(proto);
-    const bottomOffset = scaledBox.min.y;  // typically negative — distance from origin to lowest point
-
     const dist = arch.distribute || {};
     const count = dist.count || 100;
     const minD = Math.max(dist.min_dist || 60, 55);
@@ -349,9 +382,7 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
       ? Math.min(arch.real_world_size[0], arch.real_world_size[2]) * 0.15
       : 0.4;
 
-    // Clone-based placement (handles any GLB layout, no matrix gymnastics).
-    // Skip area near future player spawn (z=+85) to keep camera view clear.
-    const spawnX = 0, spawnZ = 85, spawnClearR = 18;
+    const spawnX = 35, spawnZ = 70, spawnClearR = 18;
     for (let i = 0; i < count; i++) {
       const angle = rng() * Math.PI * 2;
       const d = minD + rng() * (maxD - minD);
@@ -364,12 +395,22 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
       const clone = proto.clone(true);
       const variation = 0.8 + rng() * 0.4;
       clone.scale.multiplyScalar(variation);
-      clone.position.set(x, y - bottomOffset * variation, z);
+      clone.position.set(x, 0, z);
       clone.rotation.y = rng() * Math.PI * 2;
       clone.traverse((n) => {
         if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; }
       });
       scene.add(clone);
+      // Outlines disabled for trees — TRELLIS geometry doesn't shell cleanly
+
+      // Measure THIS clone's bottom in world space (handles any model layout)
+      clone.updateMatrixWorld(true);
+      const cloneBox = new THREE.Box3().setFromObject(clone);
+      const meshBottom = cloneBox.min.y;
+      // Bury slightly into terrain so trunk is never floating (0.15m sink)
+      clone.position.y = y - meshBottom - 0.15;
+
+      natureClones.push({ obj: clone, gx: x, gz: z, sink: 0.15 });
 
       const r = trunkR * variation;
       collisionBoxes.push(new THREE.Box3(
@@ -380,6 +421,98 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
     }
     console.log(`Placed ${arch.name}`);
   }
+}
+
+// Re-snap every placed tree/rock to current terrain height (called after the
+// final rebuildTerrainMesh, so flatten zones around buildings/trees are applied)
+function resnapNatureToTerrain() {
+  for (const item of natureClones) {
+    const { obj, gx, gz, sink } = item;
+    obj.position.y = 0;
+    obj.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(obj);
+    const meshBottom = box.min.y;
+    const groundY = getTerrainY(gx, gz);
+    obj.position.y = groundY - meshBottom - sink;
+  }
+}
+
+function resnapBuildingsToTerrain() {
+  for (const item of buildingClones) {
+    const { obj, gx, gz, fr, yOffset } = item;
+    obj.position.y = 0;
+    obj.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(obj);
+    // Sample at footprint to find lowest terrain point under building
+    const offsets = [
+      [0, 0], [fr, 0], [-fr, 0], [0, fr], [0, -fr],
+      [fr * 0.7, fr * 0.7], [-fr * 0.7, fr * 0.7],
+      [fr * 0.7, -fr * 0.7], [-fr * 0.7, -fr * 0.7],
+    ];
+    let minY = Infinity;
+    for (const [ox, oz] of offsets) minY = Math.min(minY, getTerrainY(gx + ox, gz + oz));
+    obj.position.y = minY - box.min.y - 0.05 + yOffset;
+  }
+}
+
+// Walk every mesh material in the scene and force-fix dark/textured ones.
+// TRELLIS-generated GLBs often ship with white color + dark baked texture →
+// they read as pure black silhouettes. We strip the texture and tint by size.
+function forceFixMaterials() {
+  scene.traverse((n) => {
+    if (!n.isMesh || !n.material) return;
+    const mats = Array.isArray(n.material) ? n.material : [n.material];
+    for (const m of mats) {
+      if (!m || m.type !== 'MeshToonMaterial') continue;
+      if (!m.map) continue;  // already stripped
+      // Get size from geometry
+      let size = 10;
+      if (n.geometry) {
+        n.geometry.computeBoundingBox();
+        if (n.geometry.boundingBox) {
+          const s = n.geometry.boundingBox.getSize(new THREE.Vector3());
+          size = Math.max(s.x, s.y, s.z);
+        }
+      }
+      m.map = null;
+      if (size < 8) {
+        // small → foliage
+        m.color.setHex(0x6ea63a);
+        m.emissive.setHex(0x2a4015);
+      } else if (size < 20) {
+        // medium → stone/rock
+        m.color.setHex(0x9a8870);
+        m.emissive.setHex(0x3a3025);
+      } else {
+        // large → building / wall
+        m.color.setHex(0xc4b8a4);
+        m.emissive.setHex(0x3a3328);
+      }
+      m.emissiveIntensity = 1;
+      m.needsUpdate = true;
+    }
+  });
+}
+
+// Genshin-style inverted-hull outline (dark teal — softer than pure black)
+function addOutline(root, thickness = 0.025) {
+  const outlineMat = new THREE.MeshBasicMaterial({
+    color: 0x101418,
+    side: THREE.BackSide,
+    depthWrite: true,
+    fog: true,
+  });
+  const outlines = [];
+  root.traverse((n) => {
+    if (!n.isMesh || !n.geometry) return;
+    const out = new THREE.Mesh(n.geometry, outlineMat);
+    out.scale.setScalar(1 + thickness);
+    out.position.copy(n.position);
+    out.rotation.copy(n.rotation);
+    out.renderOrder = -1;
+    outlines.push({ src: n, out });
+  });
+  for (const { src, out } of outlines) src.parent.add(out);
 }
 
 // ─── Environment / Sky ───────────────────────────────────────────────────────
@@ -437,22 +570,34 @@ function applyEnvironment(env) {
   halo.position.copy(moon.position);
   scene.add(halo);
 
-  // Lights — pushed bright so the cel-shaded scene reads at night
-  scene.add(new THREE.AmbientLight(0xc8d8f0, tod === 'night' ? 3.2 : 2.0));
-  const hemi = new THREE.HemisphereLight(0xb0d0ff, 0x506548, tod === 'night' ? 2.0 : 1.4);
+  // Three-point lighting (Genshin uses sun + warm fill + cool rim)
+  scene.add(new THREE.AmbientLight(0xc8d8f0, tod === 'night' ? 2.4 : 1.6));
+  const hemi = new THREE.HemisphereLight(0xfff2dd, 0x4a6b3a, tod === 'night' ? 1.4 : 1.8);
   scene.add(hemi);
-  const dir = new THREE.DirectionalLight(P.light, tod === 'night' ? 2.0 : 3.2);
+
+  // Key light — warm sun
+  const dir = new THREE.DirectionalLight(P.light, tod === 'night' ? 1.6 : 3.0);
   dir.position.set(90, 180, 70);
   dir.castShadow = true;
   dir.shadow.mapSize.set(2048, 2048);
   dir.shadow.camera.near = 1;
-  dir.shadow.camera.far = 600;
-  dir.shadow.camera.left = -200;
-  dir.shadow.camera.right = 200;
-  dir.shadow.camera.top = 200;
-  dir.shadow.camera.bottom = -200;
+  dir.shadow.camera.far = 500;
+  dir.shadow.camera.left = -180;
+  dir.shadow.camera.right = 180;
+  dir.shadow.camera.top = 180;
+  dir.shadow.camera.bottom = -180;
   dir.shadow.bias = -0.0005;
   scene.add(dir);
+
+  // Rim light — cool back-light for cel-shaded silhouettes (Genshin signature)
+  const rim = new THREE.DirectionalLight(0x88aaff, tod === 'night' ? 1.2 : 1.4);
+  rim.position.set(-120, 80, -150);
+  scene.add(rim);
+
+  // Fill light — warm ground bounce
+  const fill = new THREE.DirectionalLight(0xffd9a8, 0.6);
+  fill.position.set(0, -40, 80);
+  scene.add(fill);
 
   if (tod === 'night') addStars();
   addClouds(tod);
@@ -479,9 +624,9 @@ function addStars() {
 }
 
 function addClouds(tod) {
-  const cloudColor = { night: 0x1a1a40, sunset: 0x4d2a18, day: 0xeef1f8 }[tod] || 0x1a1a40;
+  const cloudColor = { night: 0x2a2a55, sunset: 0xffc4a8, day: 0xfff8f0 }[tod] || 0x2a2a55;
   const mat = new THREE.MeshBasicMaterial({
-    color: cloudColor, transparent: true, opacity: tod === 'day' ? 0.85 : 0.55, fog: false, depthWrite: false,
+    color: cloudColor, transparent: true, opacity: tod === 'day' ? 0.85 : 0.7, fog: false, depthWrite: false,
   });
   for (let i = 0; i < 10; i++) {
     const cloud = new THREE.Group();
@@ -813,17 +958,15 @@ function updatePlayer(dt) {
 }
 
 function updateCamera() {
-  const dist = 10;
-  // Cinematic high-shoulder camera so castle and skyline are always framed
+  const dist = 8;
   const offset = new THREE.Vector3(
     -Math.sin(yaw) * Math.cos(pitch) * dist,
-    Math.sin(pitch) * dist + 5.0,
+    Math.sin(pitch) * dist + 2.5,
     -Math.cos(yaw) * Math.cos(pitch) * dist,
   );
   const target = player.position.clone().add(new THREE.Vector3(0, 1.6, 0));
   let camPos = target.clone().add(offset);
-  // Keep camera at least 3m above terrain to avoid clipping
-  const minCamY = getTerrainY(camPos.x, camPos.z) + 3.0;
+  const minCamY = getTerrainY(camPos.x, camPos.z) + 2.0;
   camPos.y = Math.max(camPos.y, minCamY);
   camera.position.copy(camPos);
   camera.lookAt(target);

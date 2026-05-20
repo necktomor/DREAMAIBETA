@@ -80,7 +80,14 @@
     }
   }
   </script>
-  <script>window.__DREAMAI_VERSION = Date.now();</script>
-  <script type="module" src="main.js?v=2"></script>
+  <script>
+    window.__DREAMAI_VERSION = Date.now();
+    // Force reload main.js on every page load (modules cache by full URL)
+    const v = window.__DREAMAI_VERSION;
+    const s = document.createElement('script');
+    s.type = 'module';
+    s.src = './main.js?bust=' + v;
+    document.head.appendChild(s);
+  </script>
 </body>
 </html>
