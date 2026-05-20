@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DreamAI — 3D World</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a1a; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+    canvas { display: block; }
+
+    #overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.85);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      color: white; z-index: 100;
+    }
+    #overlay h1 { font-size: 2.5rem; margin-bottom: 0.5rem; color: #a8d8ff; }
+    #overlay p  { color: #888; margin-bottom: 2rem; }
+    #play-btn {
+      padding: 14px 40px; font-size: 1.1rem;
+      background: linear-gradient(135deg, #4a9eff, #9b59b6);
+      border: none; border-radius: 30px; color: white;
+      cursor: pointer; transition: transform .2s;
+    }
+    #play-btn:hover { transform: scale(1.05); }
+
+    #hud {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,0.6); font-size: 0.85rem; pointer-events: none;
+      display: none;
+    }
+    #loading {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      color: #a8d8ff; font-size: 1.1rem; display: none;
+    }
+    #scene-name {
+      position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,0.8); font-size: 1rem; letter-spacing: 2px;
+      text-transform: uppercase; display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <h1>✦ DreamAI</h1>
+    <p>AI-generated 3D world · Genshin-inspired</p>
+    <button id="play-btn" onclick="startGame()">Enter World</button>
+  </div>
+  <div id="loading">Loading world...</div>
+  <div id="scene-name"></div>
+  <div id="hud">WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Shift — run &nbsp;|&nbsp; ESC — cursor</div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

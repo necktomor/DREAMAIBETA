@@ -1,0 +1,142 @@
+{
+  "scene_name": "Moonlit Dark Forest & Castle",
+  "style": "Genshin Impact art style, cel-shaded, vibrant yet moody colors, detailed environmental storytelling, anime-inspired lighting",
+  "environment": {
+    "time_of_day": "night",
+    "fog": true,
+    "fog_density": 0.05,
+    "biome": "dark_forest"
+  },
+  "nature_archetypes": [
+    {
+      "name": "dark_pine_tree",
+      "flux_prompt": "dark pine tree, single object, isolated, pure white background, 3/4 angle view, full object visible, Genshin Impact style, cel-shaded, vibrant colors, clean edges, no shadows, no other objects, product photography lighting",
+      "real_world_size": [
+        4,
+        12,
+        4
+      ],
+      "use_trellis": true,
+      "distribute": {
+        "count": 250,
+        "min_dist": 50,
+        "max_dist": 260
+      }
+    },
+    {
+      "name": "mossy_forest_rock",
+      "flux_prompt": "mossy forest rock, single object, isolated, pure white background, 3/4 angle view, full object visible, Genshin Impact style, cel-shaded, vibrant colors, clean edges, no shadows, no other objects, product photography lighting",
+      "real_world_size": [
+        3,
+        2,
+        3
+      ],
+      "use_trellis": true,
+      "distribute": {
+        "count": 100,
+        "min_dist": 50,
+        "max_dist": 240
+      }
+    }
+  ],
+  "landscape": {
+    "ground_color_low": "#1a2b1a",
+    "ground_color_high": "#2d3e2d",
+    "hill_scale": 1.2,
+    "center_elevation": 6,
+    "water": false,
+    "water_color": "#000000",
+    "water_level": 0.0,
+    "particles": "fireflies",
+    "particle_color": "#aaffaa",
+    "vegetation": [
+      {
+        "type": "pine",
+        "count": 200,
+        "min_dist": 50,
+        "max_dist": 250,
+        "height_min": 6,
+        "height_max": 16,
+        "color_trunk": "#2a1f1a",
+        "color_leaves": "#1e3320"
+      }
+    ],
+    "rocks": {
+      "count": 60,
+      "color": "#3a3a3a",
+      "min_dist": 20,
+      "max_dist": 250
+    }
+  },
+  "player_spawn": {
+    "location": "exterior",
+    "position": [
+      0,
+      1.0,
+      70
+    ]
+  },
+  "buildings": [
+    {
+      "name": "Medieval Castle",
+      "layout_grid": {
+        "cell_size": 1,
+        "objects": [
+          {
+            "name": "castle_gatehouse",
+            "grid_x": 0,
+            "grid_z": 45,
+            "rotation_y": 0,
+            "y_offset": 0
+          },
+          {
+            "name": "castle_main_tower",
+            "grid_x": -35,
+            "grid_z": -30,
+            "rotation_y": 49.39870535499551,
+            "y_offset": 0
+          },
+          {
+            "name": "castle_wall_section",
+            "grid_x": -45,
+            "grid_z": 0,
+            "rotation_y": 90.0,
+            "y_offset": 0
+          }
+        ]
+      },
+      "exterior_modules": [
+        {
+          "name": "castle_main_tower",
+          "flux_prompt": "medieval castle main tower, single object, isolated, pure white background, 3/4 angle view, full object visible, Genshin Impact style, cel-shaded, vibrant colors, clean edges, no shadows, no other objects, product photography lighting",
+          "real_world_size": [
+            10,
+            25,
+            10
+          ],
+          "use_trellis": true
+        },
+        {
+          "name": "castle_wall_section",
+          "flux_prompt": "medieval castle stone wall section with battlements, single object, isolated, pure white background, 3/4 angle view, full object visible, Genshin Impact style, cel-shaded, vibrant colors, clean edges, no shadows, no other objects, product photography lighting",
+          "real_world_size": [
+            8,
+            12,
+            2
+          ],
+          "use_trellis": true
+        },
+        {
+          "name": "castle_gatehouse",
+          "flux_prompt": "medieval castle gatehouse with wooden doors and stone arch, single object, isolated, pure white background, 3/4 angle view, full object visible, Genshin Impact style, cel-shaded, vibrant colors, clean edges, no shadows, no other objects, product photography lighting",
+          "real_world_size": [
+            12,
+            15,
+            10
+          ],
+          "use_trellis": true
+        }
+      ]
+    }
+  ]
+}
