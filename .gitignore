@@ -21,3 +21,8 @@ trellis-mac-main/stubs/
 
 # OS
 .DS_Store
+
+# Secrets — must never be committed
+.env
+.env.local
+*.env

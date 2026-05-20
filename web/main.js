@@ -1,41 +1,56 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
-// Static mode (GitHub Pages) vs local dev server
-const IS_STATIC = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-const SCENE_URL = IS_STATIC ? './scene.json'  : '/api/scene';
-const GLB_URL   = (name)   => IS_STATIC ? `./glb/${name}` : `/api/glb/${name}`;
+// ─── URLs ────────────────────────────────────────────────────────────────────
+const IS_DEV = !!window.DREAMAI_DEV;
+const SCENE_URL = IS_DEV ? '/api/scene' : './scene.json';
+const GLB_URL   = (name) => IS_DEV ? `/api/glb/${name}` : `./glb/${name}`;
 
-// ─── Scene globals ────────────────────────────────────────────────────────────
-let scene, camera, renderer, clock;
+// ─── Globals ─────────────────────────────────────────────────────────────────
+let scene, camera, renderer, composer, clock;
 let player, playerBody;
-let keys = {};
-let yaw = 0, pitch = -0.3;
+let keys = {}, yaw = Math.PI, pitch = -0.15;
 let isLocked = false;
 let sceneData = null;
+let toonGradient = null;
+let waterMesh = null, waterUniforms = null;
+let snowParticles = null, lavaParticles = null, fireflyParticles = null;
+let _terrainFn = (x, z) => 0;
+let _terrainMeshGeo = null;
+const collisionBoxes = [];
+const flattenZones = [];
+const animatedItems = [];
 
-const WALK_SPEED = 8;
-const RUN_SPEED  = 16;
-const GRAVITY    = -25;
-const JUMP_VEL   = 10;
+const WALK_SPEED = 8, RUN_SPEED = 16, GRAVITY = -25, JUMP_VEL = 10;
 let velY = 0;
-const GROUND_Y = 0;
+
+const GATE_KEYWORDS = /gate|arch|gatehouse|entrance|portal|doorway|drawbridge/i;
+
+// ─── Loading progress helper ─────────────────────────────────────────────────
+function setProgress(pct, text) {
+  const bar = document.getElementById('loading-bar-fill');
+  const lbl = document.getElementById('loading-text');
+  if (bar) bar.style.width = Math.min(100, Math.max(0, pct)) + '%';
+  if (lbl && text) lbl.textContent = text;
+}
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
-window.startGame = async function() {
+window.startGame = async function () {
   document.getElementById('overlay').style.display = 'none';
-  document.getElementById('loading').style.display = 'block';
+  const loadingEl = document.getElementById('loading');
+  loadingEl.style.display = 'flex';
 
   init();
-
-  // Request pointer lock immediately (must be synchronous in click handler)
   renderer.domElement.requestPointerLock();
-
   animate();
 
   await loadScene();
 
-  document.getElementById('loading').style.display = 'none';
+  loadingEl.style.display = 'none';
   document.getElementById('hud').style.display = 'block';
   document.getElementById('scene-name').style.display = 'block';
 };
@@ -44,250 +59,212 @@ window.startGame = async function() {
 function init() {
   clock = new THREE.Clock();
 
-  // Renderer
-  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.5;
+  renderer.toneMappingExposure = 1.15;
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
   document.body.appendChild(renderer.domElement);
 
-  // Scene
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0d0d2b); // night sky default
-  renderer.setClearColor(0x0d0d2b);
+  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1200);
 
-  // Camera (third-person, follows player)
-  camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+  // Toon gradient (3 bands — sharp Genshin-like)
+  toonGradient = makeToonGradient();
 
-  // Biome built after scene loads (needs biome from JSON)
-  // placeholder flat ground so player doesn't fall
-  const tempGround = new THREE.Mesh(
-    new THREE.PlaneGeometry(600, 600),
-    new THREE.MeshLambertMaterial({ color: 0x1a3322 })
+  // Post-processing: bloom for moon, fireflies, water highlights
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  const bloom = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.28,  // strength — gentle glow
+    0.35,  // radius — tight
+    0.88,  // threshold — only bright sources (moon, fireflies, sky highlights)
   );
-  tempGround.rotation.x = -Math.PI / 2;
-  scene.add(tempGround);
+  composer.addPass(bloom);
+  composer.addPass(new OutputPass());
 
-  // Player (invisible body)
+  // Player root
   player = new THREE.Object3D();
-  player.position.set(0, 0.9, 20);
+  player.position.set(0, 5, 80);
   scene.add(player);
 
-  // Player visual (capsule placeholder)
+  // Player capsule
   playerBody = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.35, 1.0, 4, 8),
-    new THREE.MeshToonMaterial({ color: 0x4488ff })
+    new THREE.MeshToonMaterial({ color: 0x4488ff, gradientMap: toonGradient }),
   );
   playerBody.position.y = 0.85;
   playerBody.castShadow = true;
   player.add(playerBody);
 
   // Input
-  document.addEventListener('keydown', e => keys[e.code] = true);
-  document.addEventListener('keyup',   e => keys[e.code] = false);
+  document.addEventListener('keydown', (e) => (keys[e.code] = true));
+  document.addEventListener('keyup', (e) => (keys[e.code] = false));
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('pointerlockchange', () => {
     isLocked = !!document.pointerLockElement;
   });
-  // Re-lock on canvas click if lost
   renderer.domElement.addEventListener('click', () => {
     if (!isLocked) renderer.domElement.requestPointerLock();
   });
   window.addEventListener('resize', onResize);
 }
 
+// ─── Toon gradient texture ───────────────────────────────────────────────────
+function makeToonGradient() {
+  // 4-band cel-shading gradient (RGBA, since RGBFormat was removed in r155+)
+  const data = new Uint8Array([
+    60, 60, 60, 255,
+    130, 130, 130, 255,
+    200, 200, 200, 255,
+    255, 255, 255, 255,
+  ]);
+  const tex = new THREE.DataTexture(data, 4, 1, THREE.RGBAFormat);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 // ─── Load scene ──────────────────────────────────────────────────────────────
 async function loadScene() {
+  setProgress(2, 'Fetching scene…');
   const resp = await fetch(SCENE_URL);
   sceneData = await resp.json();
-
   document.getElementById('scene-name').textContent = sceneData.scene_name || 'DreamAI World';
 
-  // Apply environment FIRST so sky/moon/fog appear immediately
+  setProgress(8, 'Building atmosphere…');
   applyEnvironment(sceneData.environment);
-  renderer.setClearColor(scene.background);
 
-  // Build landscape from JSON
+  setProgress(15, 'Sculpting terrain…');
   if (sceneData.landscape) buildLandscapeFromJSON(sceneData.landscape);
 
-  // Remove temp ground
-  const temp = scene.getObjectByName('__tempGround');
-  if (temp) scene.remove(temp);
-
-  // Spawn position — place on terrain surface
+  // Position player on safe spawn (we recompute after terrain rebuild)
   if (sceneData.player_spawn?.position) {
     const [x, , z] = sceneData.player_spawn.position;
-    player.position.set(x, getTerrainY(x, z), z);
+    player.position.set(x, getTerrainY(x, z) + 1, z);
   }
 
   const loader = new GLTFLoader();
-
-  // Load building GLBs first (they define flatten zones)
   const buildings = sceneData.buildings || [];
+  const totalSteps =
+    buildings.reduce((s, b) => s + (b.exterior_modules || []).length, 0) +
+    (sceneData.nature_archetypes || []).length;
+  let done = 0;
 
-  for (const building of buildings) {
-    const layout  = building.layout_grid || {};
-    const cell    = layout.cell_size || 5;
+  for (const b of buildings) {
+    const layout = b.layout_grid || {};
+    const cell = layout.cell_size || 5;
     const gridMap = {};
-    for (const g of (layout.objects || [])) gridMap[g.name] = g;
-
-    for (const mod of (building.exterior_modules || [])) {
-      const gdata = gridMap[mod.name] || {};
-      await spawnObject(loader, mod, gdata, cell);
+    for (const g of layout.objects || []) gridMap[g.name] = g;
+    for (const mod of b.exterior_modules || []) {
+      await spawnObject(loader, mod, gridMap[mod.name] || {}, cell);
+      done++;
+      setProgress(20 + (done / totalSteps) * 50, `Placing ${mod.name}…`);
     }
   }
 
-  // Rebuild terrain with flatten zones from buildings
+  setProgress(72, 'Re-sculpting terrain…');
   rebuildTerrainMesh();
 
-  // Now load nature archetypes (trees placed on already-flattened terrain)
+  setProgress(78, 'Planting forest…');
   await loadNatureArchetypes(loader, sceneData.nature_archetypes || [], sceneData.landscape);
 
-  // Rebuild again after trees register their flatten zones
+  setProgress(94, 'Finalising terrain…');
   rebuildTerrainMesh();
-}
 
-async function loadNatureArchetypes(loader, archetypes, landscape) {
-  const waterLevel = landscape?.water_level ?? 0;
-
-  for (const arch of archetypes) {
-    const url = GLB_URL(arch.name + '.glb');
-    let proto = null;
-
-    try {
-      const gltf = await new Promise((res, rej) => loader.load(url, res, null, rej));
-      proto = gltf.scene;
-      // Scale to real_world_size
-      if (arch.real_world_size?.length === 3) {
-        const box = new THREE.Box3().setFromObject(proto);
-        const size = box.getSize(new THREE.Vector3());
-        const modelMax  = Math.max(size.x, size.y, size.z);
-        const targetMax = Math.max(...arch.real_world_size);
-        if (modelMax > 0) proto.scale.setScalar(targetMax / modelMax);
-      }
-      proto.traverse(n => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; } });
-    } catch {
-      console.warn(`Nature archetype GLB not found: ${arch.name} — skipping`);
-      continue;
+  // Spawn player at a clear cinematic viewpoint — back from the gate so castle is fully framed
+  const spawnX = 0;
+  const spawnZ = 85;
+  // Clear any trees within 12m of spawn so view isn't blocked
+  for (let i = collisionBoxes.length - 1; i >= 0; i--) {
+    const b = collisionBoxes[i];
+    const cx = (b.min.x + b.max.x) / 2;
+    const cz = (b.min.z + b.max.z) / 2;
+    if (Math.hypot(cx - spawnX, cz - spawnZ) < 12) {
+      collisionBoxes.splice(i, 1);
     }
-
-    // Distribute clones across terrain
-    const dist  = arch.distribute || {};
-    const count = dist.count   || 100;
-    const minD  = dist.min_dist || 60;
-    const maxD  = dist.max_dist || 260;
-    const rng   = mulberry32(hashStr(arch.name));
-
-    for (let i = 0; i < count; i++) {
-      const angle = rng() * Math.PI * 2;
-      const d     = minD + rng() * (maxD - minD);
-      const x = Math.cos(angle) * d;
-      const z = Math.sin(angle) * d;
-      const y = getTerrainY(x, z);
-      if (landscape?.water && y < waterLevel + 0.5) continue;
-
-      const clone = proto.clone(true);
-      // Lift so bottom sits on ground
-      const box = new THREE.Box3().setFromObject(clone);
-      clone.position.set(x, y - box.min.y, z);
-      clone.rotation.y = rng() * Math.PI * 2;
-      // Slight random scale variation
-      const sv = 0.7 + rng() * 0.6;
-      clone.scale.multiplyScalar(sv);
-      scene.add(clone);
-      // Trunk-width collision (narrow so you can walk around, not through)
-      const trunkR = arch.real_world_size ? Math.min(arch.real_world_size[0], arch.real_world_size[2]) * 0.15 : 0.4;
-      collisionBoxes.push(new THREE.Box3(
-        new THREE.Vector3(x - trunkR, -999, z - trunkR),
-        new THREE.Vector3(x + trunkR,  999, z + trunkR)
-      ));
-      // Small flatten zone at tree base so it doesn't float
-      registerFlattenZone(x, z, trunkR * 3);
-    }
-    console.log(`Nature: placed ${count}× ${arch.name}`);
   }
+  player.position.set(spawnX, getTerrainY(spawnX, spawnZ) + 1, spawnZ);
+  yaw = Math.PI;     // face -Z (toward castle keep)
+  pitch = -0.08;
+  window.__dreamai = { scene, camera, player, getTerrainY };
+  setProgress(100, 'Ready');
 }
 
-function hashStr(s) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
-}
-
+// ─── Building objects ────────────────────────────────────────────────────────
 async function spawnObject(loader, mod, gdata, cellSize) {
   const url = GLB_URL(mod.name + '.glb');
-
   try {
     const gltf = await new Promise((res, rej) => loader.load(url, res, null, rej));
     const root = gltf.scene;
 
-    // Keep original GLB materials — just enable shadows
-    root.traverse(node => {
-      if (node.isMesh) {
-        node.castShadow    = true;
-        node.receiveShadow = true;
-        // Boost brightness on standard materials
-        const mats = Array.isArray(node.material) ? node.material : [node.material];
-        mats.forEach(m => {
-          if (m?.isMeshStandardMaterial) {
-            m.roughness  = Math.min(m.roughness + 0.1, 1.0);
-            m.metalness  = Math.max(m.metalness - 0.1, 0.0);
-          }
-        });
-      }
+    // Cel-shaded materials (convert MeshStandard → MeshToon)
+    root.traverse((node) => {
+      if (!node.isMesh) return;
+      node.castShadow = true;
+      node.receiveShadow = true;
+      const mats = Array.isArray(node.material) ? node.material : [node.material];
+      const replaced = mats.map((m) => convertToToon(m));
+      node.material = replaced.length === 1 ? replaced[0] : replaced;
     });
+
+    // Add warm lantern light + glow point lights to keeps/towers
+    if (/keep|tower|gatehouse/i.test(mod.name)) {
+      const lantern = new THREE.PointLight(0xffaa55, 1.5, 35, 1.6);
+      lantern.position.set(0, mod.real_world_size ? mod.real_world_size[1] * 0.55 : 6, 0);
+      root.add(lantern);
+      // Visible glow sphere so bloom catches it
+      const glow = new THREE.Mesh(
+        new THREE.SphereGeometry(0.5, 12, 12),
+        new THREE.MeshBasicMaterial({ color: 0xffcc77, fog: false }),
+      );
+      glow.position.copy(lantern.position);
+      root.add(glow);
+    }
 
     // Scale to real-world size
     if (mod.real_world_size?.length === 3) {
       const box = new THREE.Box3().setFromObject(root);
       const size = box.getSize(new THREE.Vector3());
-      const modelMax  = Math.max(size.x, size.y, size.z);
+      const modelMax = Math.max(size.x, size.y, size.z);
       const targetMax = Math.max(...mod.real_world_size);
       if (modelMax > 0) root.scale.setScalar(targetMax / modelMax);
     }
 
-    // Position from grid — lift model so its bottom sits on ground
     const gx = (gdata.grid_x || 0) * cellSize;
     const gz = (gdata.grid_z || 0) * cellSize;
     const ry = THREE.MathUtils.degToRad(gdata.rotation_y || 0);
     root.position.set(gx, 0, gz);
     root.rotation.y = ry;
 
-    // Re-measure after scale
     const boxAfter = new THREE.Box3().setFromObject(root);
-    const size3d   = boxAfter.getSize(new THREE.Vector3());
+    const size3d = boxAfter.getSize(new THREE.Vector3());
 
-    // Sample terrain at multiple footprint points → use the MINIMUM height
-    // so the object never floats above the lowest terrain point under it
+    // Sample terrain at footprint, take minimum so object never floats
     const fr = Math.max(size3d.x, size3d.z) * 0.4;
-    const sampleOffsets = [
+    const offsets = [
       [0, 0], [fr, 0], [-fr, 0], [0, fr], [0, -fr],
-      [fr*0.7, fr*0.7], [-fr*0.7, fr*0.7], [fr*0.7, -fr*0.7], [-fr*0.7, -fr*0.7]
+      [fr * 0.7, fr * 0.7], [-fr * 0.7, fr * 0.7],
+      [fr * 0.7, -fr * 0.7], [-fr * 0.7, -fr * 0.7],
     ];
     let minGroundY = Infinity;
-    for (const [ox, oz] of sampleOffsets) {
-      minGroundY = Math.min(minGroundY, getTerrainY(gx + ox, gz + oz));
-    }
+    for (const [ox, oz] of offsets) minGroundY = Math.min(minGroundY, getTerrainY(gx + ox, gz + oz));
 
-    // Use 80th percentile of bounding box bottom — ignore stray geometry
-    // that dips far below the actual base (roots, decorations, etc.)
-    const meshBottomY = boxAfter.min.y + size3d.y * 0.08;
-
+    // Use actual mesh bottom (no 8% percentile) so it sits flat
+    const meshBottomY = boxAfter.min.y;
     root.position.y = minGroundY - meshBottomY + (gdata.y_offset || 0);
 
     scene.add(root);
     addCollisionBox(root, mod.name);
-
-    // Flatten zone: bring ALL terrain in footprint to minGroundY
-    const footprint = fr + 12;
-    registerFlattenZone(gx, gz, footprint, minGroundY);
-
-    console.log(`Loaded: ${mod.name} at (${gx}, 0, ${gz})`);
+    registerFlattenZone(gx, gz, fr + 12, minGroundY);
   } catch (e) {
-    console.warn(`Failed to load ${mod.name}:`, e);
+    console.warn(`Failed: ${mod.name} — ${e.message}`);
     spawnPlaceholder(mod, gdata, cellSize);
   }
 }
@@ -296,281 +273,322 @@ function spawnPlaceholder(mod, gdata, cellSize) {
   const [w, h, d] = mod.real_world_size || [4, 4, 4];
   const mesh = new THREE.Mesh(
     new THREE.BoxGeometry(w, h, d),
-    new THREE.MeshToonMaterial({ color: 0x6633aa, transparent: true, opacity: 0.5 })
+    new THREE.MeshToonMaterial({ color: 0x6633aa, gradientMap: toonGradient }),
   );
   const px = (gdata.grid_x || 0) * cellSize;
   const pz = (gdata.grid_z || 0) * cellSize;
   mesh.position.set(px, getTerrainY(px, pz) + h / 2, pz);
+  mesh.castShadow = true;
   scene.add(mesh);
 }
 
-// ─── Toon gradient texture ────────────────────────────────────────────────────
-let _toonGrad = null;
-function makeToonGradient() {
-  if (_toonGrad) return _toonGrad;
-  const data = new Uint8Array([80, 120, 200, 255]);
-  _toonGrad = new THREE.DataTexture(data, 4, 1);
-  _toonGrad.needsUpdate = true;
-  return _toonGrad;
+function convertToToon(m) {
+  if (!m) return new THREE.MeshToonMaterial({ color: 0x888888, gradientMap: toonGradient });
+  if (m.isMeshToonMaterial) return m;
+  const toon = new THREE.MeshToonMaterial({
+    color: m.color ? m.color.clone() : new THREE.Color(0xffffff),
+    map: m.map || null,
+    gradientMap: toonGradient,
+    transparent: !!m.transparent,
+    opacity: m.opacity ?? 1,
+    side: m.side ?? THREE.FrontSide,
+  });
+  return toon;
 }
 
-// ─── Environment ─────────────────────────────────────────────────────────────
-let skyDome = null;
+// ─── Nature: InstancedMesh per archetype ─────────────────────────────────────
+async function loadNatureArchetypes(loader, archetypes, landscape) {
+  const waterLevel = landscape?.water_level ?? 0;
+  const hasWater = !!landscape?.water;
 
+  for (const arch of archetypes) {
+    const url = GLB_URL(arch.name + '.glb');
+    let proto = null;
+    try {
+      const gltf = await new Promise((res, rej) => loader.load(url, res, null, rej));
+      proto = gltf.scene;
+    } catch {
+      console.warn(`Archetype skipped: ${arch.name}`);
+      continue;
+    }
+
+    // Cel-shading materials
+    proto.traverse((n) => {
+      if (!n.isMesh) return;
+      const mats = Array.isArray(n.material) ? n.material : [n.material];
+      n.material = mats.length === 1 ? convertToToon(mats[0]) : mats.map(convertToToon);
+    });
+
+    // Uniformly scale proto to target real_world_size
+    let baseScale = 1;
+    if (arch.real_world_size?.length === 3) {
+      const box = new THREE.Box3().setFromObject(proto);
+      const size = box.getSize(new THREE.Vector3());
+      const modelMax = Math.max(size.x, size.y, size.z);
+      const targetMax = Math.max(...arch.real_world_size);
+      if (modelMax > 0) baseScale = targetMax / modelMax;
+    }
+    proto.scale.setScalar(baseScale);
+    proto.updateMatrixWorld(true);
+
+    // Measure bottom AFTER scaling so we know how much to lift each instance
+    const scaledBox = new THREE.Box3().setFromObject(proto);
+    const bottomOffset = scaledBox.min.y;  // typically negative — distance from origin to lowest point
+
+    const dist = arch.distribute || {};
+    const count = dist.count || 100;
+    const minD = Math.max(dist.min_dist || 60, 55);
+    const maxD = dist.max_dist || 260;
+    const rng = mulberry32(hashStr(arch.name));
+    const trunkR = arch.real_world_size
+      ? Math.min(arch.real_world_size[0], arch.real_world_size[2]) * 0.15
+      : 0.4;
+
+    // Clone-based placement (handles any GLB layout, no matrix gymnastics).
+    // Skip area near future player spawn (z=+85) to keep camera view clear.
+    const spawnX = 0, spawnZ = 85, spawnClearR = 18;
+    for (let i = 0; i < count; i++) {
+      const angle = rng() * Math.PI * 2;
+      const d = minD + rng() * (maxD - minD);
+      const x = Math.cos(angle) * d;
+      const z = Math.sin(angle) * d;
+      if (Math.hypot(x - spawnX, z - spawnZ) < spawnClearR) continue;
+      const y = getTerrainY(x, z);
+      if (hasWater && y < waterLevel + 0.5) continue;
+
+      const clone = proto.clone(true);
+      const variation = 0.8 + rng() * 0.4;
+      clone.scale.multiplyScalar(variation);
+      clone.position.set(x, y - bottomOffset * variation, z);
+      clone.rotation.y = rng() * Math.PI * 2;
+      clone.traverse((n) => {
+        if (n.isMesh) { n.castShadow = true; n.receiveShadow = true; }
+      });
+      scene.add(clone);
+
+      const r = trunkR * variation;
+      collisionBoxes.push(new THREE.Box3(
+        new THREE.Vector3(x - r, -999, z - r),
+        new THREE.Vector3(x + r, 999, z + r),
+      ));
+      registerFlattenZone(x, z, r * 3);
+    }
+    console.log(`Placed ${arch.name}`);
+  }
+}
+
+// ─── Environment / Sky ───────────────────────────────────────────────────────
 function applyEnvironment(env) {
   const tod = env?.time_of_day || 'night';
+  const palette = {
+    night:  { top: 0x05071c, horiz: 0x0a1432, light: 0xaaaaff, ambient: 0x4a5680, fog: 0x0a0a25 },
+    sunset: { top: 0x1a0820, horiz: 0xe65a2a, light: 0xffaa66, ambient: 0x553c44, fog: 0x2a1010 },
+    day:    { top: 0x4a8edb, horiz: 0x9ccfff, light: 0xfff3dc, ambient: 0xccddff, fog: 0xa0c0e0 },
+  };
+  const P = palette[tod] || palette.night;
 
-  // ── Sky dome (big sphere, no fog, always around camera) ──
-  const skyTop    = { night: 0x05051a, sunset: 0x1a0805, day: 0x0a1840 };
-  const skyHoriz  = { night: 0x0d1030, sunset: 0x3d1208, day: 0x1a3060 };
-  scene.background = new THREE.Color(skyTop[tod] || skyTop.night);
-  renderer.setClearColor(scene.background);
+  // Gradient sky via shader
+  const skyUniforms = {
+    topColor:    { value: new THREE.Color(P.top) },
+    bottomColor: { value: new THREE.Color(P.horiz) },
+    offset:      { value: 33 },
+    exponent:    { value: 0.6 },
+  };
+  const skyGeo = new THREE.SphereGeometry(800, 32, 16);
+  const skyMat = new THREE.ShaderMaterial({
+    uniforms: skyUniforms,
+    vertexShader: `
+      varying vec3 vWorldPosition;
+      void main() {
+        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+        vWorldPosition = worldPosition.xyz;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: `
+      uniform vec3 topColor;
+      uniform vec3 bottomColor;
+      uniform float offset;
+      uniform float exponent;
+      varying vec3 vWorldPosition;
+      void main() {
+        float h = normalize(vWorldPosition + vec3(0.0, offset, 0.0)).y;
+        gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
+      }`,
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const sky = new THREE.Mesh(skyGeo, skyMat);
+  scene.add(sky);
+  scene.background = new THREE.Color(P.horiz);
 
-  skyDome = new THREE.Mesh(
-    new THREE.SphereGeometry(500, 32, 16),
-    new THREE.MeshBasicMaterial({
-      color: skyHoriz[tod] || skyHoriz.night,
-      side: THREE.BackSide,
-      depthWrite: false,
-      fog: false,
-    })
-  );
-  scene.add(skyDome);
-
-  // ── Moon (attached to sky dome so fog never hides it) ──
-  const moonColor = { night: 0xeeeeff, sunset: 0xff8833, day: 0xffffcc };
+  // Moon (glow handled by bloom)
+  const moonColor = tod === 'sunset' ? 0xffd07a : tod === 'day' ? 0xffffff : 0xffffee;
   const moon = new THREE.Mesh(
-    new THREE.SphereGeometry(12, 20, 20),
-    new THREE.MeshBasicMaterial({ color: moonColor[tod] || moonColor.night, fog: false })
+    new THREE.SphereGeometry(14, 24, 24),
+    new THREE.MeshBasicMaterial({ color: moonColor, fog: false }),
   );
-  // Put moon on sky dome surface in upper-right direction
-  moon.position.set(200, 350, -300);
+  moon.position.set(220, 380, -320);
   scene.add(moon);
-
-  // Moon halo
   const halo = new THREE.Mesh(
-    new THREE.SphereGeometry(18, 20, 20),
+    new THREE.SphereGeometry(22, 24, 24),
     new THREE.MeshBasicMaterial({
-      color: moonColor[tod] || moonColor.night,
-      transparent: true, opacity: 0.12,
-      fog: false
-    })
+      color: moonColor, transparent: true, opacity: 0.18, fog: false,
+    }),
   );
   halo.position.copy(moon.position);
   scene.add(halo);
 
-  // ── Lights ──
-  scene.add(new THREE.AmbientLight(0xffffff, tod === 'night' ? 2.5 : 3.5));
-
-  const hemi = new THREE.HemisphereLight(0xaaaaff, 0x113311, 1.0);
+  // Lights — pushed bright so the cel-shaded scene reads at night
+  scene.add(new THREE.AmbientLight(0xb0c4e0, tod === 'night' ? 2.6 : 2.0));
+  const hemi = new THREE.HemisphereLight(0xa0c0ff, 0x405038, tod === 'night' ? 1.6 : 1.4);
   scene.add(hemi);
-
-  const dirColors = { night: 0xaaaaff, sunset: 0xff8844, day: 0xfffae0 };
-  const dir = new THREE.DirectionalLight(dirColors[tod] || dirColors.night, 2.0);
-  dir.position.set(80, 150, 60);
+  const dir = new THREE.DirectionalLight(P.light, tod === 'night' ? 1.6 : 3.2);
+  dir.position.set(90, 180, 70);
   dir.castShadow = true;
   dir.shadow.mapSize.set(2048, 2048);
-  dir.shadow.camera.near = 1; dir.shadow.camera.far = 600;
-  dir.shadow.camera.left = -250; dir.shadow.camera.right = 250;
-  dir.shadow.camera.top  = 250; dir.shadow.camera.bottom = -250;
+  dir.shadow.camera.near = 1;
+  dir.shadow.camera.far = 600;
+  dir.shadow.camera.left = -200;
+  dir.shadow.camera.right = 200;
+  dir.shadow.camera.top = 200;
+  dir.shadow.camera.bottom = -200;
+  dir.shadow.bias = -0.0005;
   scene.add(dir);
 
-  // ── Stars ──
   if (tod === 'night') addStars();
-
-  // ── Clouds ──
   addClouds(tod);
 
-  // ── Fog (reduced density so it doesn't swallow everything) ──
   if (env?.fog) {
-    const fogColors = { night: 0x0a0a25, sunset: 0x1a0808, day: 0x102030 };
-    scene.fog = new THREE.FogExp2(fogColors[tod] || fogColors.night, 0.008);
+    scene.fog = new THREE.FogExp2(P.fog, 0.0055);
   }
 }
 
 function addStars() {
   const pos = [];
-  for (let i = 0; i < 3000; i++) {
+  for (let i = 0; i < 2500; i++) {
     const theta = Math.random() * Math.PI * 2;
-    const phi   = Math.random() * Math.PI * 0.5;
-    const r     = 400;
+    const phi = Math.random() * Math.PI * 0.45;
+    const r = 600;
     pos.push(r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 0.6, sizeAttenuation: true })));
+  const mat = new THREE.PointsMaterial({
+    color: 0xffffff, size: 0.9, sizeAttenuation: true, transparent: true, opacity: 0.85, fog: false,
+  });
+  scene.add(new THREE.Points(geo, mat));
 }
 
-function addClouds(tod = 'night') {
-  const cloudColor = { night: 0x1a1a40, sunset: 0x3d1a10, day: 0x334466 };
+function addClouds(tod) {
+  const cloudColor = { night: 0x1a1a40, sunset: 0x4d2a18, day: 0xeef1f8 }[tod] || 0x1a1a40;
   const mat = new THREE.MeshBasicMaterial({
-    color: cloudColor[tod] || cloudColor.night,
-    transparent: true, opacity: 0.5, fog: false
+    color: cloudColor, transparent: true, opacity: tod === 'day' ? 0.85 : 0.55, fog: false, depthWrite: false,
   });
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 10; i++) {
     const cloud = new THREE.Group();
     const n = 3 + Math.floor(Math.random() * 3);
     for (let j = 0; j < n; j++) {
-      const s = 8 + Math.random() * 12;
-      const puff = new THREE.Mesh(new THREE.SphereGeometry(s, 6, 6), mat);
-      puff.position.set((j - n/2) * 10 + Math.random() * 5, Math.random() * 4, Math.random() * 4);
+      const s = 10 + Math.random() * 14;
+      const puff = new THREE.Mesh(new THREE.SphereGeometry(s, 7, 7), mat);
+      puff.position.set((j - n / 2) * 11 + Math.random() * 5, Math.random() * 4, Math.random() * 4);
       cloud.add(puff);
     }
     cloud.position.set(
-      (Math.random() - 0.5) * 300,
-      60 + Math.random() * 40,
-      (Math.random() - 0.5) * 300
+      (Math.random() - 0.5) * 400,
+      80 + Math.random() * 40,
+      (Math.random() - 0.5) * 400,
     );
+    cloud.userData.driftSpeed = 0.3 + Math.random() * 0.3;
     scene.add(cloud);
+    animatedItems.push({ type: 'cloud', obj: cloud });
   }
 }
 
-// ─── Dynamic landscape from JSON ──────────────────────────────────────────────
-
-function hexToRgb(hex) {
-  const n = parseInt((hex||'#888888').replace('#',''), 16);
-  return { r: ((n>>16)&255)/255, g: ((n>>8)&255)/255, b: (n&255)/255 };
-}
+// ─── Landscape ───────────────────────────────────────────────────────────────
+function hexToColor(hex) { return new THREE.Color(hex || '#888888'); }
 
 function buildLandscapeFromJSON(ls) {
-  const hillScale    = ls.hill_scale    || 1.0;
-  const centerElev   = ls.center_elevation ?? 2;
-  const waterLevel   = ls.water_level   ?? 0;
-  const colorLow  = hexToRgb(ls.ground_color_low  || '#1a3322');
-  const colorHigh = hexToRgb(ls.ground_color_high || '#2a5533');
+  const hillScale = ls.hill_scale || 1.0;
+  const centerElev = ls.center_elevation ?? 2;
+  const waterLevel = ls.water_level ?? 0;
+  const cLow = hexToColor(ls.ground_color_low || '#1a3322');
+  const cHigh = hexToColor(ls.ground_color_high || '#2a5533');
 
-  // Terrain
-  makeTerrain(600, 120,
+  makeTerrain(600, 140,
     (x, z) => {
-      const d = Math.sqrt(x*x + z*z);
-      const flat = Math.max(0, 1 - d / 65);
+      const d = Math.sqrt(x * x + z * z);
+      const flat = Math.max(0, 1 - d / 70);
       const base = noise(x, z) * hillScale;
-      // Always lift center so objects aren't underwater
       return base * (1 - flat * 0.9) + flat * centerElev;
     },
-    (x, y) => {
+    (x, y, z) => {
+      // Height-based + procedural mottling
       const t = Math.max(0, Math.min(1, (y - waterLevel) / 12));
-      return {
-        r: colorLow.r + (colorHigh.r - colorLow.r) * t,
-        g: colorLow.g + (colorHigh.g - colorLow.g) * t,
-        b: colorLow.b + (colorHigh.b - colorLow.b) * t,
-      };
-    }
+      const mottle = (Math.sin(x * 0.5) * Math.cos(z * 0.4) + Math.sin(x * 0.13 + z * 0.11) * 0.6) * 0.06;
+      const r = cLow.r + (cHigh.r - cLow.r) * t + mottle;
+      const g = cLow.g + (cHigh.g - cLow.g) * t + mottle;
+      const b = cLow.b + (cHigh.b - cLow.b) * t + mottle;
+      return { r, g, b };
+    },
   );
 
-  // Water
   if (ls.water) {
-    const wColor = parseInt((ls.water_color || '#1a5a8a').replace('#',''), 16);
-    const wgeo = new THREE.PlaneGeometry(600, 600, 60, 60);
-    wgeo.rotateX(-Math.PI/2);
-    waterMesh = new THREE.Mesh(wgeo,
-      new THREE.MeshLambertMaterial({ color: wColor, transparent: true, opacity: 0.82 })
-    );
+    const wColor = new THREE.Color(ls.water_color || '#1a5a8a');
+    const wgeo = new THREE.PlaneGeometry(800, 800, 1, 1);
+    wgeo.rotateX(-Math.PI / 2);
+    waterUniforms = {
+      time:        { value: 0 },
+      waterColor:  { value: wColor },
+      shallowColor:{ value: new THREE.Color(wColor.r * 1.4, wColor.g * 1.6, wColor.b * 1.4) },
+    };
+    const wmat = new THREE.ShaderMaterial({
+      uniforms: waterUniforms,
+      vertexShader: `
+        uniform float time;
+        varying vec3 vWorldPosition;
+        varying float vWave;
+        void main() {
+          vec4 wp = modelMatrix * vec4(position, 1.0);
+          float w =
+            sin(wp.x * 0.07 + time * 0.9) * 0.35 +
+            cos(wp.z * 0.05 + time * 0.7) * 0.30 +
+            sin((wp.x + wp.z) * 0.03 + time * 0.5) * 0.20;
+          vWave = w;
+          wp.y += w;
+          vWorldPosition = wp.xyz;
+          gl_Position = projectionMatrix * viewMatrix * wp;
+        }`,
+      fragmentShader: `
+        uniform vec3 waterColor;
+        uniform vec3 shallowColor;
+        uniform float time;
+        varying vec3 vWorldPosition;
+        varying float vWave;
+        void main() {
+          float foam = smoothstep(0.45, 0.55, vWave);
+          float shimmer = sin(vWorldPosition.x * 0.4 + time * 2.0) *
+                          cos(vWorldPosition.z * 0.35 + time * 1.6);
+          shimmer = max(0.0, shimmer) * 0.18;
+          vec3 col = mix(waterColor, shallowColor, foam + shimmer);
+          gl_FragColor = vec4(col, 0.88);
+        }`,
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    waterMesh = new THREE.Mesh(wgeo, wmat);
     waterMesh.position.y = waterLevel + 0.1;
     scene.add(waterMesh);
   }
 
-  // Vegetation and rocks are handled by TRELLIS nature_archetypes (see loadNatureArchetypes)
-
-  // Particles
-  if (ls.particles === 'snow')       addSnowParticles();
-  else if (ls.particles === 'ash')   addLavaParticles();
+  if (ls.particles === 'snow') addSnowParticles();
+  else if (ls.particles === 'ash') addLavaParticles();
   else if (ls.particles === 'fireflies') addFireflies(ls.particle_color);
-  else if (ls.particles === 'rain')  addRainParticles();
+  else if (ls.particles === 'rain') addRainParticles();
 }
 
-function buildVegShape(type, h, trunkM, leafM, g, rng) {
-  switch (type) {
-    case 'pine': case 'dead_tree':
-      g.add(cyl(0.15, 0.28, h*0.45, trunkM, h*0.22));
-      if (type === 'pine') {
-        for (let l=0; l<3; l++) g.add(cone(h*0.25*(1-l*0.18), h*0.5, leafM, h*0.38+l*h*0.2));
-      } else {
-        for (let i=0; i<4; i++) {
-          const b = new THREE.Mesh(new THREE.CylinderGeometry(0.06,0.12,h*0.3,4), trunkM);
-          b.position.set(Math.cos(i*1.57)*h*0.22, h*0.4+rng()*h*0.2, Math.sin(i*1.57)*h*0.22);
-          b.rotation.z = (rng()-0.5)*1.0; g.add(b);
-        }
-      }
-      break;
-    case 'palm':
-      g.add(cyl(0.25, 0.4, h, trunkM, h/2));
-      for (let i=0; i<6; i++) {
-        const leaf = new THREE.Mesh(new THREE.ConeGeometry(2+rng()*1.5, 5, 5), leafM);
-        leaf.position.set(Math.cos(i*1.05)*2.5, h+0.5, Math.sin(i*1.05)*2.5);
-        leaf.rotation.z = 0.7; g.add(leaf);
-      }
-      break;
-    case 'oak': case 'bamboo':
-      g.add(cyl(0.25, 0.38, h*0.55, trunkM, h*0.27));
-      const crown = new THREE.Mesh(new THREE.SphereGeometry(h*0.32, 7, 7), leafM);
-      crown.position.y = h*0.72; g.add(crown);
-      if (type === 'bamboo') {
-        for (let s=0; s<5; s++) {
-          const seg = new THREE.Mesh(new THREE.CylinderGeometry(0.1,0.12,h*0.2,6), trunkM);
-          seg.position.y = s*h*0.22+h*0.1; g.add(seg);
-        }
-      }
-      break;
-    case 'cactus':
-      g.add(cyl(0.3, 0.4, h, trunkM, h/2));
-      if (rng()>0.4) {
-        const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.2,0.25,h*0.5,6), trunkM);
-        arm.position.set(h*0.35, h*0.45, 0); arm.rotation.z = 0.5; g.add(arm);
-      }
-      break;
-    case 'mushroom':
-      g.add(cyl(0.15, 0.2, h*0.6, trunkM, h*0.3));
-      const cap = new THREE.Mesh(new THREE.SphereGeometry(h*0.5, 8, 4), leafM);
-      cap.scale.y = 0.5; cap.position.y = h*0.7; g.add(cap);
-      break;
-    default: // bush
-      g.add(new THREE.Mesh(new THREE.SphereGeometry(h*0.5, 6, 5), leafM));
-      g.children[0].position.y = h*0.5;
-      break;
-  }
-}
-
-function addFireflies(colorHex) {
-  const color = parseInt((colorHex||'#88ff44').replace('#',''), 16);
-  const geo = new THREE.BufferGeometry();
-  const pos = [];
-  for (let i=0; i<500; i++)
-    pos.push((Math.random()-0.5)*200, 1+Math.random()*8, (Math.random()-0.5)*200);
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  const ff = new THREE.Points(geo, new THREE.PointsMaterial({ color, size: 0.6 }));
-  scene.add(ff);
-  // Animate in render loop via userData
-  ff.userData.isFirefly = true;
-  ff.userData.time = 0;
-}
-
-function addRainParticles() {
-  const geo = new THREE.BufferGeometry();
-  const pos = [], vel = [];
-  for (let i=0; i<3000; i++) {
-    pos.push((Math.random()-0.5)*300, Math.random()*60, (Math.random()-0.5)*300);
-    vel.push(0.5, -(8+Math.random()*4), 0.2);
-  }
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  geo.setAttribute('velocity', new THREE.Float32BufferAttribute(vel, 3));
-  snowParticles = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xaaaacc, size: 0.2 }));
-  scene.add(snowParticles);
-}
-
-// ─── Biome system ─────────────────────────────────────────────────────────────
-
-let waterMesh = null; // animated
-
-// ─────── Shared terrain helper ────────────────────────────────────────────────
-
-// ─── Terrain ─────────────────────────────────────────────────────────────────
-
-// Active terrain height function — updated when terrain is built
-let _terrainFn = (x, z) => 0;
-
+// ─── Terrain helpers ─────────────────────────────────────────────────────────
 function noise(x, z) {
-  // Multi-octave sine noise (no library needed)
   return (
     Math.sin(x * 0.03 + 1.2) * Math.cos(z * 0.025) * 8 +
     Math.sin(x * 0.07 + z * 0.05) * 4 +
@@ -578,9 +596,6 @@ function noise(x, z) {
     Math.sin(x * 0.2 + z * 0.15) * 1
   );
 }
-
-// Flatten zones — registered when objects are placed
-const flattenZones = []; // {x, z, r, y}
 
 function registerFlattenZone(x, z, radius, targetY = null) {
   const y = targetY !== null ? targetY : _terrainFn(x, z);
@@ -590,58 +605,21 @@ function registerFlattenZone(x, z, radius, targetY = null) {
 function getTerrainY(x, z) {
   const base = _terrainFn(x, z);
   if (flattenZones.length === 0) return base;
-
-  let maxInfluence = 0;
-  let blendY = base;
-
+  let maxInf = 0, blendY = base;
   for (const zone of flattenZones) {
     const d = Math.sqrt((x - zone.x) ** 2 + (z - zone.z) ** 2);
     if (d < zone.r * 2.5) {
       const t = 1 - Math.min(1, d / zone.r);
-      const smooth = t * t * (3 - 2 * t); // smoothstep
-      if (smooth > maxInfluence) {
-        maxInfluence = smooth;
-        blendY = zone.y;
-      }
+      const smooth = t * t * (3 - 2 * t);
+      if (smooth > maxInf) { maxInf = smooth; blendY = zone.y; }
     }
   }
-
-  return base * (1 - maxInfluence) + blendY * maxInfluence;
+  return base * (1 - maxInf) + blendY * maxInf;
 }
-
-let _terrainMeshGeo = null; // reference for rebuild
-
-function rebuildTerrainMesh() {
-  if (!_terrainMeshGeo) return;
-  const pos = _terrainMeshGeo.attributes.position;
-  const col = _terrainMeshGeo.attributes.color;
-  const hasColor = !!col;
-
-  for (let i = 0; i < pos.count; i++) {
-    const x = pos.getX(i), z = pos.getZ(i);
-    const y = getTerrainY(x, z);
-    pos.setY(i, y);
-
-    // Update vertex color to match new height (darker = lower)
-    if (hasColor) {
-      const t = Math.max(0, Math.min(1, (y + 2) / 14));
-      col.setXYZ(i,
-        0.04 + t * 0.08,
-        0.10 + t * 0.16,
-        0.04 + t * 0.04
-      );
-    }
-  }
-  pos.needsUpdate = true;
-  if (hasColor) col.needsUpdate = true;
-  _terrainMeshGeo.computeVertexNormals();
-  console.log(`Terrain rebuilt: ${flattenZones.length} flatten zones`);
-}
-
-// ─── Terrain mesh builder (shared) ───────────────────────────────────────────
 
 function makeTerrain(SIZE, SEGS, heightFn, colorFn) {
-  _terrainFn = heightFn; // ← physics uses this same function
+  _terrainFn = heightFn;
+  _terrainColorFn = colorFn;
   const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGS, SEGS);
   geo.rotateX(-Math.PI / 2);
   const pos = geo.attributes.position;
@@ -656,194 +634,138 @@ function makeTerrain(SIZE, SEGS, heightFn, colorFn) {
   pos.needsUpdate = true;
   geo.computeVertexNormals();
   geo.setAttribute('color', new THREE.Float32BufferAttribute(cols, 3));
-  _terrainMeshGeo = geo; // save for rebuild after object placement
-  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  _terrainMeshGeo = geo;
+  const mat = new THREE.MeshToonMaterial({
+    vertexColors: true,
+    gradientMap: toonGradient,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
+  mesh.name = 'terrain';
   scene.add(mesh);
 }
 
-function spawnObjects(count, minDist, maxDist, seed, fn) {
-  const rng = mulberry32(seed);
-  for (let i = 0; i < count; i++) {
-    const a = rng() * Math.PI * 2;
-    const d = minDist + rng() * (maxDist - minDist);
-    fn(Math.cos(a) * d, Math.sin(a) * d, rng);
+let _terrainColorFn = null;
+
+function rebuildTerrainMesh() {
+  if (!_terrainMeshGeo) return;
+  const pos = _terrainMeshGeo.attributes.position;
+  const col = _terrainMeshGeo.attributes.color;
+  const hasColor = !!col;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const y = getTerrainY(x, z);
+    pos.setY(i, y);
+    if (hasColor && _terrainColorFn) {
+      const c = _terrainColorFn(x, y, z);
+      col.setXYZ(i, c.r, c.g, c.b);
+    }
   }
-}
-
-
-// Biome template functions removed — terrain from JSON landscape + TRELLIS nature_archetypes
-
-
-// ─── Shared helpers ──────────────────────────────────────────────────────────
-
-function cyl(rt, rb, h, mat, py=0) {
-  const m = new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,7), mat);
-  m.position.y = py; m.castShadow = true; return m;
-}
-function cone(r, h, mat, py=0) {
-  const m = new THREE.Mesh(new THREE.ConeGeometry(r,h,7), mat);
-  m.position.y = py; m.castShadow = true; return m;
-}
-function spawnRocks(count, minD, maxD, color, seed) {
-  const mat = new THREE.MeshLambertMaterial({ color });
-  const rng = mulberry32(seed);
-  for (let i=0; i<count; i++) {
-    const a = rng()*Math.PI*2, d = minD+rng()*(maxD-minD);
-    const x = Math.cos(a)*d, z = Math.sin(a)*d;
-    const s = 0.5+rng()*2.5;
-    const r = new THREE.Mesh(new THREE.DodecahedronGeometry(s,0), mat);
-    r.position.set(x, getTerrainY(x,z)+s*0.4, z);
-    r.rotation.set(rng()*Math.PI, rng()*Math.PI, rng()*Math.PI);
-    r.castShadow = true; scene.add(r);
-  }
+  pos.needsUpdate = true;
+  if (hasColor) col.needsUpdate = true;
+  _terrainMeshGeo.computeVertexNormals();
 }
 
 // ─── Particles ───────────────────────────────────────────────────────────────
-
-let snowParticles = null, lavaParticles = null;
+function makeParticleTexture(color = '#ffffff') {
+  const c = document.createElement('canvas');
+  c.width = c.height = 64;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, color);
+  g.addColorStop(0.4, color.length === 7 ? color + '88' : color);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 64, 64);
+  const tex = new THREE.CanvasTexture(c);
+  tex.needsUpdate = true;
+  return tex;
+}
 
 function addSnowParticles() {
   const geo = new THREE.BufferGeometry();
   const pos = [], vel = [];
-  for (let i=0; i<2000; i++) {
-    pos.push((Math.random()-0.5)*400, Math.random()*80, (Math.random()-0.5)*400);
-    vel.push((Math.random()-0.5)*0.5, -(0.5+Math.random()*1.5), (Math.random()-0.5)*0.5);
+  for (let i = 0; i < 2000; i++) {
+    pos.push((Math.random() - 0.5) * 500, Math.random() * 80, (Math.random() - 0.5) * 500);
+    vel.push((Math.random() - 0.5) * 0.5, -(0.5 + Math.random() * 1.5), (Math.random() - 0.5) * 0.5);
   }
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   geo.setAttribute('velocity', new THREE.Float32BufferAttribute(vel, 3));
-  snowParticles = new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xeeeeff, size: 0.4 }));
+  snowParticles = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xeef2ff, size: 0.8, map: makeParticleTexture('#ffffff'), transparent: true,
+    depthWrite: false, alphaTest: 0.1,
+  }));
   scene.add(snowParticles);
 }
 
 function addLavaParticles() {
   const geo = new THREE.BufferGeometry();
   const pos = [], vel = [];
-  for (let i=0; i<1000; i++) {
-    const a = Math.random()*Math.PI*2, d = Math.random()*100;
-    pos.push(Math.cos(a)*d, Math.random()*5, Math.sin(a)*d);
-    vel.push((Math.random()-0.5)*0.3, 0.5+Math.random()*2, (Math.random()-0.5)*0.3);
+  for (let i = 0; i < 800; i++) {
+    const a = Math.random() * Math.PI * 2, d = Math.random() * 120;
+    pos.push(Math.cos(a) * d, Math.random() * 5, Math.sin(a) * d);
+    vel.push((Math.random() - 0.5) * 0.3, 0.5 + Math.random() * 2, (Math.random() - 0.5) * 0.3);
   }
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   geo.setAttribute('velocity', new THREE.Float32BufferAttribute(vel, 3));
-  const cols = [0xff4400, 0xff8800, 0xffcc00];
-  lavaParticles = new THREE.Points(geo,
-    new THREE.PointsMaterial({ color: cols[Math.floor(Math.random()*3)], size: 0.8, fog: false }));
+  lavaParticles = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xff7733, size: 1.2, map: makeParticleTexture('#ff8855'),
+    transparent: true, depthWrite: false, fog: false, blending: THREE.AdditiveBlending,
+  }));
   scene.add(lavaParticles);
 }
 
-// Simple seedable RNG (no Math.random so terrain is reproducible)
-function mulberry32(seed) {
-  return function() {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296;
-  };
+function addFireflies(colorHex) {
+  const color = new THREE.Color(colorHex || '#aaff77');
+  const geo = new THREE.BufferGeometry();
+  const pos = [], phase = [];
+  for (let i = 0; i < 500; i++) {
+    pos.push((Math.random() - 0.5) * 280, 1 + Math.random() * 10, (Math.random() - 0.5) * 280);
+    phase.push(Math.random() * Math.PI * 2);
+  }
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('phase', new THREE.Float32BufferAttribute(phase, 1));
+  fireflyParticles = new THREE.Points(geo, new THREE.PointsMaterial({
+    color, size: 1.4, map: makeParticleTexture('#ddffaa'),
+    transparent: true, depthWrite: false, fog: false,
+    blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  }));
+  scene.add(fireflyParticles);
 }
 
-// ─── Mouse look ──────────────────────────────────────────────────────────────
-function onMouseMove(e) {
-  if (!isLocked) return;
-  yaw   -= e.movementX * 0.002;
-  pitch -= e.movementY * 0.002;
-  pitch  = Math.max(-0.8, Math.min(1.0, pitch));
+function addRainParticles() {
+  const geo = new THREE.BufferGeometry();
+  const pos = [], vel = [];
+  for (let i = 0; i < 3000; i++) {
+    pos.push((Math.random() - 0.5) * 400, Math.random() * 80, (Math.random() - 0.5) * 400);
+    vel.push(0.5, -(10 + Math.random() * 5), 0.2);
+  }
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('velocity', new THREE.Float32BufferAttribute(vel, 3));
+  snowParticles = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0xaaaacc, size: 0.3, transparent: true, opacity: 0.6, depthWrite: false,
+  }));
+  scene.add(snowParticles);
 }
 
-// ─── Game loop ───────────────────────────────────────────────────────────────
-function animate() {
-  requestAnimationFrame(animate);
-  const dt = Math.min(clock.getDelta(), 0.05);
-
-  updatePlayer(dt);
-  updateCamera();
-  if (skyDome) skyDome.position.copy(camera.position);
-
-  const t = clock.elapsedTime;
-
-  // Animate water waves
-  if (waterMesh) {
-    const p = waterMesh.geometry.attributes.position;
-    for (let i=0; i<p.count; i++) {
-      const x = p.getX(i), z = p.getZ(i);
-      p.setY(i, Math.sin(x*0.05+t)*0.4 + Math.cos(z*0.04+t*0.8)*0.3);
-    }
-    p.needsUpdate = true;
-    waterMesh.geometry.computeVertexNormals();
-  }
-
-  // Animate snow
-  if (snowParticles) {
-    const p = snowParticles.geometry.attributes.position;
-    const v = snowParticles.geometry.attributes.velocity;
-    for (let i=0; i<p.count; i++) {
-      let y = p.getY(i) + v.getY(i)*dt;
-      if (y < 0) y = 80;
-      p.setX(i, p.getX(i) + v.getX(i)*dt);
-      p.setY(i, y);
-      p.setZ(i, p.getZ(i) + v.getZ(i)*dt);
-    }
-    p.needsUpdate = true;
-  }
-
-  // Animate lava embers
-  if (lavaParticles) {
-    const p = lavaParticles.geometry.attributes.position;
-    const v = lavaParticles.geometry.attributes.velocity;
-    for (let i=0; i<p.count; i++) {
-      let y = p.getY(i) + v.getY(i)*dt;
-      if (y > 30) { y = 0; p.setX(i,(Math.random()-0.5)*200); p.setZ(i,(Math.random()-0.5)*200); }
-      p.setY(i, y);
-    }
-    p.needsUpdate = true;
-  }
-
-  renderer.render(scene, camera);
-}
-
-// Collision bounding boxes — filled when GLBs load
-const collisionBoxes = [];
-
-const GATE_KEYWORDS = /gate|arch|gatehouse|entrance|portal|doorway|drawbridge/i;
-
+// ─── Player + camera ─────────────────────────────────────────────────────────
 function addCollisionBox(object3d, name = '') {
   const box = new THREE.Box3().setFromObject(object3d);
   const size = box.getSize(new THREE.Vector3());
   const cx = (box.min.x + box.max.x) / 2;
   const cz = (box.min.z + box.max.z) / 2;
-
   if (GATE_KEYWORDS.test(name)) {
-    // Gate/arch — split into two pillars with walkable gap in the middle
-    // Opening width ~40% of the narrower side, minimum 3m
     const openingHalf = Math.max(size.x, size.z) * 0.20;
-
     if (size.x >= size.z) {
-      // Gate wider along X → split left/right pillar, gap in center X
-      const left = box.clone();
-      left.max.x = cx - openingHalf;
-      left.min.x += size.x * 0.02;
-
-      const right = box.clone();
-      right.min.x = cx + openingHalf;
-      right.max.x -= size.x * 0.02;
-
+      const left = box.clone(); left.max.x = cx - openingHalf; left.min.x += size.x * 0.02;
+      const right = box.clone(); right.min.x = cx + openingHalf; right.max.x -= size.x * 0.02;
       collisionBoxes.push(left, right);
     } else {
-      // Gate wider along Z → split front/back pillar
-      const front = box.clone();
-      front.max.z = cz - openingHalf;
-      front.min.z += size.z * 0.02;
-
-      const back = box.clone();
-      back.min.z = cz + openingHalf;
-      back.max.z -= size.z * 0.02;
-
+      const front = box.clone(); front.max.z = cz - openingHalf; front.min.z += size.z * 0.02;
+      const back = box.clone(); back.min.z = cz + openingHalf; back.max.z -= size.z * 0.02;
       collisionBoxes.push(front, back);
     }
-
-    console.log(`Gate collision: 2 pillars with ${(openingHalf*2).toFixed(1)}m gap — ${name}`);
   } else {
-    // Normal solid object — very small shrink so player can get close
     box.min.x += size.x * 0.02; box.max.x -= size.x * 0.02;
     box.min.z += size.z * 0.02; box.max.z -= size.z * 0.02;
     collisionBoxes.push(box);
@@ -851,46 +773,40 @@ function addCollisionBox(object3d, name = '') {
 }
 
 function isBlocked(x, z) {
-  const testBox = new THREE.Box3(
+  const tb = new THREE.Box3(
     new THREE.Vector3(x - 0.35, -999, z - 0.35),
-    new THREE.Vector3(x + 0.35,  999, z + 0.35)
+    new THREE.Vector3(x + 0.35, 999, z + 0.35),
   );
-  return collisionBoxes.some(b => b.intersectsBox(testBox));
+  return collisionBoxes.some((b) => b.intersectsBox(tb));
+}
+
+function onMouseMove(e) {
+  if (!isLocked) return;
+  yaw -= e.movementX * 0.002;
+  pitch -= e.movementY * 0.002;
+  pitch = Math.max(-0.8, Math.min(1.0, pitch));
 }
 
 function updatePlayer(dt) {
   if (!sceneData) return;
   const speed = keys['ShiftLeft'] || keys['ShiftRight'] ? RUN_SPEED : WALK_SPEED;
-
   const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-  const right   = new THREE.Vector3( Math.cos(yaw), 0, -Math.sin(yaw));
-  const move    = new THREE.Vector3();
-
-  if (keys['KeyW'] || keys['ArrowUp'])    move.add(forward);
-  if (keys['KeyS'] || keys['ArrowDown'])  move.sub(forward);
-  if (keys['KeyA'] || keys['ArrowLeft'])  move.sub(right);
+  const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const move = new THREE.Vector3();
+  if (keys['KeyW'] || keys['ArrowUp']) move.add(forward);
+  if (keys['KeyS'] || keys['ArrowDown']) move.sub(forward);
+  if (keys['KeyA'] || keys['ArrowLeft']) move.sub(right);
   if (keys['KeyD'] || keys['ArrowRight']) move.add(right);
-
   if (move.length() > 0) {
     move.normalize().multiplyScalar(speed * dt);
     const nx = player.position.x + move.x;
     const nz = player.position.z + move.z;
-
-    // Collision: try full move, then X-only, then Z-only
-    if (!isBlocked(nx, nz)) {
-      player.position.x = nx;
-      player.position.z = nz;
-    } else if (!isBlocked(nx, player.position.z)) {
-      player.position.x = nx;
-    } else if (!isBlocked(player.position.x, nz)) {
-      player.position.z = nz;
-    }
-
+    if (!isBlocked(nx, nz)) { player.position.x = nx; player.position.z = nz; }
+    else if (!isBlocked(nx, player.position.z)) player.position.x = nx;
+    else if (!isBlocked(player.position.x, nz)) player.position.z = nz;
     const angle = Math.atan2(move.x, move.z);
     playerBody.rotation.y = THREE.MathUtils.lerp(playerBody.rotation.y, angle, 0.2);
   }
-
-  // Terrain gravity
   const terrainY = getTerrainY(player.position.x, player.position.z);
   velY += GRAVITY * dt;
   if (keys['Space'] && player.position.y <= terrainY + 0.1) velY = JUMP_VEL;
@@ -903,24 +819,12 @@ function updateCamera() {
   const offset = new THREE.Vector3(
     -Math.sin(yaw) * Math.cos(pitch) * dist,
     Math.sin(pitch) * dist + 1.6,
-    -Math.cos(yaw) * Math.cos(pitch) * dist
+    -Math.cos(yaw) * Math.cos(pitch) * dist,
   );
   const target = player.position.clone().add(new THREE.Vector3(0, 1.6, 0));
   let camPos = target.clone().add(offset);
-
-  // Prevent camera from going below terrain
   const minCamY = getTerrainY(camPos.x, camPos.z) + 1.0;
   camPos.y = Math.max(camPos.y, minCamY);
-
-  // Pull camera in if terrain blocks line of sight
-  const dir = camPos.clone().sub(target).normalize();
-  const ray = new THREE.Raycaster(target, dir, 0.5, dist);
-  const hits = ray.intersectObjects(scene.children, true)
-    .filter(h => h.object !== playerBody && !(h.object.material?.fog === false));
-  if (hits.length > 0) {
-    camPos = target.clone().add(dir.multiplyScalar(hits[0].distance - 0.3));
-  }
-
   camera.position.copy(camPos);
   camera.lookAt(target);
 }
@@ -929,4 +833,77 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  composer?.setSize(window.innerWidth, window.innerHeight);
+}
+
+// ─── Animation loop ──────────────────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  updatePlayer(dt);
+  updateCamera();
+
+  if (waterUniforms) waterUniforms.time.value = t;
+
+  if (snowParticles) {
+    const p = snowParticles.geometry.attributes.position;
+    const v = snowParticles.geometry.attributes.velocity;
+    for (let i = 0; i < p.count; i++) {
+      let y = p.getY(i) + v.getY(i) * dt;
+      if (y < 0) y = 80;
+      p.setX(i, p.getX(i) + v.getX(i) * dt);
+      p.setY(i, y);
+      p.setZ(i, p.getZ(i) + v.getZ(i) * dt);
+    }
+    p.needsUpdate = true;
+  }
+
+  if (lavaParticles) {
+    const p = lavaParticles.geometry.attributes.position;
+    const v = lavaParticles.geometry.attributes.velocity;
+    for (let i = 0; i < p.count; i++) {
+      let y = p.getY(i) + v.getY(i) * dt;
+      if (y > 30) { y = 0; p.setX(i, (Math.random() - 0.5) * 200); p.setZ(i, (Math.random() - 0.5) * 200); }
+      p.setY(i, y);
+    }
+    p.needsUpdate = true;
+  }
+
+  if (fireflyParticles) {
+    const p = fireflyParticles.geometry.attributes.position;
+    const ph = fireflyParticles.geometry.attributes.phase;
+    for (let i = 0; i < p.count; i++) {
+      const phase = ph.getX(i);
+      p.setY(i, p.getY(i) + Math.sin(t * 2 + phase) * 0.02);
+      p.setX(i, p.getX(i) + Math.cos(t * 1.3 + phase) * 0.03);
+    }
+    p.needsUpdate = true;
+    fireflyParticles.material.opacity = 0.6 + Math.sin(t * 3) * 0.3;
+  }
+
+  for (const item of animatedItems) {
+    if (item.type === 'cloud') {
+      item.obj.position.x += item.obj.userData.driftSpeed * dt;
+      if (item.obj.position.x > 250) item.obj.position.x = -250;
+    }
+  }
+
+  composer.render();
+}
+
+// ─── Utils ───────────────────────────────────────────────────────────────────
+function hashStr(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }

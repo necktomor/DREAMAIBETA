@@ -33,6 +33,23 @@
     #loading {
       position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
       color: #a8d8ff; font-size: 1.1rem; display: none;
+      flex-direction: column; align-items: center; gap: 18px;
+    }
+    .spinner {
+      width: 44px; height: 44px; border-radius: 50%;
+      border: 3px solid rgba(168,216,255,0.2);
+      border-top-color: #a8d8ff;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading-bar {
+      width: 280px; height: 4px; border-radius: 2px;
+      background: rgba(168,216,255,0.15); overflow: hidden;
+    }
+    #loading-bar-fill {
+      height: 100%; width: 0%;
+      background: linear-gradient(90deg, #4a9eff, #9b59b6);
+      transition: width 0.25s ease-out;
     }
     #scene-name {
       position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
@@ -47,9 +64,13 @@
     <p>AI-generated 3D world · Genshin-inspired</p>
     <button id="play-btn" onclick="startGame()">Enter World</button>
   </div>
-  <div id="loading">Loading world...</div>
+  <div id="loading">
+    <div class="spinner"></div>
+    <div id="loading-text">Loading world…</div>
+    <div id="loading-bar"><div id="loading-bar-fill"></div></div>
+  </div>
   <div id="scene-name"></div>
-  <div id="hud">WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Shift — run &nbsp;|&nbsp; ESC — cursor</div>
+  <div id="hud">WASD — move &nbsp;|&nbsp; Mouse — look &nbsp;|&nbsp; Shift — run &nbsp;|&nbsp; Space — jump &nbsp;|&nbsp; ESC — cursor</div>
 
   <script type="importmap">
   {
