@@ -1,10 +1,10 @@
 {
-  "scene_name": "Moonlit Dark Forest & Castle",
-  "style": "Genshin Impact art style, cel-shaded, vibrant yet moody colors, detailed environmental storytelling, anime-inspired lighting",
+  "scene_name": "Misty Forest Castle at Dawn",
+  "style": "Genshin Impact art style, cel-shaded, vibrant pastel colors, detailed environmental storytelling, anime-inspired lighting",
   "environment": {
-    "time_of_day": "night",
-    "fog": true,
-    "fog_density": 0.05,
+    "time_of_day": "sunset",
+    "fog": false,
+    "fog_density": 0.0,
     "biome": "dark_forest"
   },
   "nature_archetypes": [
@@ -40,15 +40,15 @@
     }
   ],
   "landscape": {
-    "ground_color_low": "#1a2b1a",
-    "ground_color_high": "#2d3e2d",
+    "ground_color_low": "#3a5230",
+    "ground_color_high": "#7a9255",
     "hill_scale": 1.2,
     "center_elevation": 6,
     "water": false,
     "water_color": "#000000",
     "water_level": 0.0,
     "particles": "fireflies",
-    "particle_color": "#aaffaa",
+    "particle_color": "#ffdd88",
     "vegetation": [
       {
         "type": "pine",

@@ -1,9 +1,5 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 // ─── URLs ────────────────────────────────────────────────────────────────────
 const IS_DEV = !!window.DREAMAI_DEV;
@@ -11,7 +7,7 @@ const SCENE_URL = IS_DEV ? '/api/scene' : './scene.json';
 const GLB_URL   = (name) => IS_DEV ? `/api/glb/${name}` : `./glb/${name}`;
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
-let scene, camera, renderer, composer, clock;
+let scene, camera, renderer, clock;
 let player, playerBody;
 let keys = {}, yaw = Math.PI, pitch = -0.15;
 let isLocked = false;
@@ -45,7 +41,7 @@ window.startGame = async function () {
   loadingEl.style.display = 'flex';
 
   init();
-  renderer.domElement.requestPointerLock();
+  try { renderer.domElement.requestPointerLock(); } catch (e) { /* headless / iframe */ }
   animate();
 
   await loadScene();
@@ -75,17 +71,8 @@ function init() {
   // Toon gradient (3 bands — sharp Genshin-like)
   toonGradient = makeToonGradient();
 
-  // Post-processing: bloom for moon, fireflies, water highlights
-  composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, camera));
-  const bloom = new UnrealBloomPass(
-    new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.28,  // strength — gentle glow
-    0.35,  // radius — tight
-    0.88,  // threshold — only bright sources (moon, fireflies, sky highlights)
-  );
-  composer.addPass(bloom);
-  composer.addPass(new OutputPass());
+  // Note: post-processing (bloom) was removed for stability — was producing
+  // colour-banding artefacts on certain GPUs. Cel-shading alone reads well.
 
   // Player root
   player = new THREE.Object3D();
@@ -178,9 +165,9 @@ async function loadScene() {
   setProgress(94, 'Finalising terrain…');
   rebuildTerrainMesh();
 
-  // Spawn player at a clear cinematic viewpoint — back from the gate so castle is fully framed
-  const spawnX = 0;
-  const spawnZ = 85;
+  // Spawn at angled cinematic viewpoint — see castle in 3/4 perspective, not blocked by gate
+  const spawnX = 35;
+  const spawnZ = 70;
   // Clear any trees within 12m of spawn so view isn't blocked
   for (let i = collisionBoxes.length - 1; i >= 0; i--) {
     const b = collisionBoxes[i];
@@ -191,8 +178,9 @@ async function loadScene() {
     }
   }
   player.position.set(spawnX, getTerrainY(spawnX, spawnZ) + 1, spawnZ);
-  yaw = Math.PI;     // face -Z (toward castle keep)
-  pitch = -0.08;
+  // Face toward origin (castle keep) at a slight downward angle
+  yaw = Math.atan2(spawnX, spawnZ) + Math.PI;
+  pitch = -0.12;
   window.__dreamai = { scene, camera, player, getTerrainY };
   setProgress(100, 'Ready');
 }
@@ -283,16 +271,33 @@ function spawnPlaceholder(mod, gdata, cellSize) {
 }
 
 function convertToToon(m) {
-  if (!m) return new THREE.MeshToonMaterial({ color: 0x888888, gradientMap: toonGradient });
+  if (!m) return new THREE.MeshToonMaterial({ color: 0xaaaaaa, gradientMap: toonGradient });
   if (m.isMeshToonMaterial) return m;
+  // Brighten dark TRELLIS-generated albedos so they read in daylight
+  let col;
+  if (m.color) {
+    col = m.color.clone();
+    // If material is very dark, lift toward mid-grey
+    const lum = col.r * 0.3 + col.g * 0.59 + col.b * 0.11;
+    if (lum < 0.15) {
+      col.lerp(new THREE.Color(0xaaaaaa), 0.6);
+    }
+  } else {
+    col = new THREE.Color(0xcccccc);
+  }
   const toon = new THREE.MeshToonMaterial({
-    color: m.color ? m.color.clone() : new THREE.Color(0xffffff),
+    color: col,
     map: m.map || null,
     gradientMap: toonGradient,
     transparent: !!m.transparent,
     opacity: m.opacity ?? 1,
     side: m.side ?? THREE.FrontSide,
   });
+  // If the original had emissive/textures, copy them
+  if (m.emissive && m.emissive.getHex() !== 0) {
+    toon.emissive = m.emissive.clone();
+    toon.emissiveIntensity = m.emissiveIntensity ?? 1;
+  }
   return toon;
 }
 
@@ -381,46 +386,39 @@ async function loadNatureArchetypes(loader, archetypes, landscape) {
 function applyEnvironment(env) {
   const tod = env?.time_of_day || 'night';
   const palette = {
-    night:  { top: 0x05071c, horiz: 0x0a1432, light: 0xaaaaff, ambient: 0x4a5680, fog: 0x0a0a25 },
-    sunset: { top: 0x1a0820, horiz: 0xe65a2a, light: 0xffaa66, ambient: 0x553c44, fog: 0x2a1010 },
+    night:  { top: 0x101840, horiz: 0x2a3a70, light: 0xaaaaff, ambient: 0x4a5680, fog: 0x1a1f3a },
+    sunset: { top: 0x6a4070, horiz: 0xff9a55, light: 0xffd098, ambient: 0xc5a070, fog: 0xc88060 },
     day:    { top: 0x4a8edb, horiz: 0x9ccfff, light: 0xfff3dc, ambient: 0xccddff, fog: 0xa0c0e0 },
   };
   const P = palette[tod] || palette.night;
 
-  // Gradient sky via shader
-  const skyUniforms = {
-    topColor:    { value: new THREE.Color(P.top) },
-    bottomColor: { value: new THREE.Color(P.horiz) },
-    offset:      { value: 33 },
-    exponent:    { value: 0.6 },
-  };
+  // Simple solid background + gradient sky using vertex colors (more reliable than shader)
   const skyGeo = new THREE.SphereGeometry(800, 32, 16);
-  const skyMat = new THREE.ShaderMaterial({
-    uniforms: skyUniforms,
-    vertexShader: `
-      varying vec3 vWorldPosition;
-      void main() {
-        vec4 worldPosition = modelMatrix * vec4(position, 1.0);
-        vWorldPosition = worldPosition.xyz;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: `
-      uniform vec3 topColor;
-      uniform vec3 bottomColor;
-      uniform float offset;
-      uniform float exponent;
-      varying vec3 vWorldPosition;
-      void main() {
-        float h = normalize(vWorldPosition + vec3(0.0, offset, 0.0)).y;
-        gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0);
-      }`,
+  const colors = [];
+  const posAttr = skyGeo.attributes.position;
+  const topC = new THREE.Color(P.top);
+  const horC = new THREE.Color(P.horiz);
+  for (let i = 0; i < posAttr.count; i++) {
+    const y = posAttr.getY(i);
+    const t = Math.max(0, Math.min(1, (y + 200) / 1000));  // 0 at bottom, 1 at top
+    colors.push(
+      horC.r + (topC.r - horC.r) * t,
+      horC.g + (topC.g - horC.g) * t,
+      horC.b + (topC.b - horC.b) * t,
+    );
+  }
+  skyGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  const skyMat = new THREE.MeshBasicMaterial({
+    vertexColors: true,
     side: THREE.BackSide,
     depthWrite: false,
     fog: false,
   });
   const sky = new THREE.Mesh(skyGeo, skyMat);
+  sky.renderOrder = -1;
   scene.add(sky);
   scene.background = new THREE.Color(P.horiz);
+  renderer.setClearColor(P.horiz, 1);
 
   // Moon (glow handled by bloom)
   const moonColor = tod === 'sunset' ? 0xffd07a : tod === 'day' ? 0xffffff : 0xffffee;
@@ -440,10 +438,10 @@ function applyEnvironment(env) {
   scene.add(halo);
 
   // Lights — pushed bright so the cel-shaded scene reads at night
-  scene.add(new THREE.AmbientLight(0xb0c4e0, tod === 'night' ? 2.6 : 2.0));
-  const hemi = new THREE.HemisphereLight(0xa0c0ff, 0x405038, tod === 'night' ? 1.6 : 1.4);
+  scene.add(new THREE.AmbientLight(0xc8d8f0, tod === 'night' ? 3.2 : 2.0));
+  const hemi = new THREE.HemisphereLight(0xb0d0ff, 0x506548, tod === 'night' ? 2.0 : 1.4);
   scene.add(hemi);
-  const dir = new THREE.DirectionalLight(P.light, tod === 'night' ? 1.6 : 3.2);
+  const dir = new THREE.DirectionalLight(P.light, tod === 'night' ? 2.0 : 3.2);
   dir.position.set(90, 180, 70);
   dir.castShadow = true;
   dir.shadow.mapSize.set(2048, 2048);
@@ -815,15 +813,17 @@ function updatePlayer(dt) {
 }
 
 function updateCamera() {
-  const dist = 6;
+  const dist = 10;
+  // Cinematic high-shoulder camera so castle and skyline are always framed
   const offset = new THREE.Vector3(
     -Math.sin(yaw) * Math.cos(pitch) * dist,
-    Math.sin(pitch) * dist + 1.6,
+    Math.sin(pitch) * dist + 5.0,
     -Math.cos(yaw) * Math.cos(pitch) * dist,
   );
   const target = player.position.clone().add(new THREE.Vector3(0, 1.6, 0));
   let camPos = target.clone().add(offset);
-  const minCamY = getTerrainY(camPos.x, camPos.z) + 1.0;
+  // Keep camera at least 3m above terrain to avoid clipping
+  const minCamY = getTerrainY(camPos.x, camPos.z) + 3.0;
   camPos.y = Math.max(camPos.y, minCamY);
   camera.position.copy(camPos);
   camera.lookAt(target);
@@ -833,7 +833,6 @@ function onResize() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  composer?.setSize(window.innerWidth, window.innerHeight);
 }
 
 // ─── Animation loop ──────────────────────────────────────────────────────────
@@ -890,7 +889,7 @@ function animate() {
     }
   }
 
-  composer.render();
+  renderer.render(scene, camera);
 }
 
 // ─── Utils ───────────────────────────────────────────────────────────────────
